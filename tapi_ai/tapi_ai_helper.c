@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Interpretica Unipessoal Lda */
 /** @file
  * @brief The embedded tsf-ai python helper (GENERATED from
@@ -7,7 +7,7 @@
 
 /* See description in tapi_ai_internal.h */
 const char tapi_ai_helper_py[] =
-    "# SPDX-License-Identifier: Apache-2.0\n"
+    "# SPDX-License-Identifier: MIT\n"
     "# Copyright (C) 2026 Interpretica Unipessoal Lda\n"
     "#\n"
     "# The tsf-ai helper: one provider-neutral request spec in on stdin, a\n"
