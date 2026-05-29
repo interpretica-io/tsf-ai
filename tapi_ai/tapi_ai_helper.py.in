@@ -1,0 +1,321 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Interpretica Unipessoal Lda
+#
+# The tsf-ai helper: one provider-neutral request spec in on stdin, a
+# stream of line events out on stdout. Standard library only (urllib,
+# json, base64, ssl) so it runs on any agent that has python3. The API
+# key is read from the environment (TSF_AI_KEY), never from argv.
+#
+# Input (stdin): one JSON object
+#   {shape, base_url, model, system, messages:[{role,text,attachments:
+#    [{path,media_type}]}], max_tokens, temperature, json_mode, stream}
+# Output (stdout): one JSON object per line
+#   {"t":"delta","text":"..."}                      (streaming pieces)
+#   {"t":"final","text":..,"model":..,"finish_reason":..,"usage":{...}}
+#   {"t":"error","message":"...","status":N}
+import base64
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+
+
+def emit(obj):
+    # Compact separators (no spaces): the C side searches for literal
+    # "t":"final" etc, so the event lines must not carry "t": "final".
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def die(message, status=0):
+    emit({"t": "error", "message": str(message), "status": status})
+    sys.exit(0)
+
+
+def file_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
+def build_openai(spec):
+    msgs = []
+    if spec.get("system"):
+        msgs.append({"role": "system", "content": spec["system"]})
+    for m in spec["messages"]:
+        atts = m.get("attachments") or []
+        if not atts:
+            msgs.append({"role": m["role"], "content": m["text"]})
+            continue
+        parts = [{"type": "text", "text": m["text"]}]
+        for a in atts:
+            mt = a["media_type"]
+            data = file_b64(a["path"])
+            if mt.startswith("image/"):
+                parts.append({"type": "image_url",
+                              "image_url":
+                                  {"url": "data:%s;base64,%s" % (mt, data)}})
+            else:
+                # OpenAI chat takes documents as file parts (base64 data).
+                parts.append({"type": "file",
+                              "file": {"filename": os.path.basename(a["path"]),
+                                       "file_data":
+                                           "data:%s;base64,%s" % (mt, data)}})
+        msgs.append({"role": m["role"], "content": parts})
+    body = {"model": spec["model"], "messages": msgs}
+    if spec.get("max_tokens"):
+        body["max_tokens"] = spec["max_tokens"]
+    if spec.get("temperature") is not None:
+        body["temperature"] = spec["temperature"]
+    if spec.get("json_mode"):
+        body["response_format"] = {"type": "json_object"}
+    if spec.get("stream"):
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+    url = spec["base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("TSF_AI_KEY")
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    return url, headers, body
+
+
+def build_anthropic(spec):
+    msgs = []
+    for m in spec["messages"]:
+        blocks = []
+        for a in m.get("attachments") or []:
+            mt = a["media_type"]
+            src = {"type": "base64", "media_type": mt, "data": file_b64(a["path"])}
+            if mt == "application/pdf":
+                blocks.append({"type": "document", "source": src})
+            else:
+                blocks.append({"type": "image", "source": src})
+        if m["text"]:
+            blocks.append({"type": "text", "text": m["text"]})
+        msgs.append({"role": m["role"], "content": blocks})
+    body = {"model": spec["model"], "messages": msgs,
+            "max_tokens": spec.get("max_tokens") or 1024}
+    if spec.get("system"):
+        body["system"] = spec["system"]
+    if spec.get("temperature") is not None:
+        body["temperature"] = spec["temperature"]
+    if spec.get("stream"):
+        body["stream"] = True
+    url = spec["base_url"].rstrip("/") + "/v1/messages"
+    headers = {"Content-Type": "application/json",
+               "anthropic-version": "2023-06-01"}
+    key = os.environ.get("TSF_AI_KEY")
+    if key:
+        headers["x-api-key"] = key
+    return url, headers, body
+
+
+def build_gemini(spec):
+    contents = []
+    for m in spec["messages"]:
+        role = "model" if m["role"] == "assistant" else "user"
+        parts = []
+        if m["text"]:
+            parts.append({"text": m["text"]})
+        for a in m.get("attachments") or []:
+            parts.append({"inline_data": {"mime_type": a["media_type"],
+                                          "data": file_b64(a["path"])}})
+        contents.append({"role": role, "parts": parts})
+    body = {"contents": contents}
+    gen = {}
+    if spec.get("max_tokens"):
+        gen["maxOutputTokens"] = spec["max_tokens"]
+    if spec.get("temperature") is not None:
+        gen["temperature"] = spec["temperature"]
+    if spec.get("json_mode"):
+        gen["responseMimeType"] = "application/json"
+    if gen:
+        body["generationConfig"] = gen
+    if spec.get("system"):
+        body["systemInstruction"] = {"parts": [{"text": spec["system"]}]}
+    verb = "streamGenerateContent" if spec.get("stream") else "generateContent"
+    url = "%s/models/%s:%s" % (spec["base_url"].rstrip("/"), spec["model"], verb)
+    if spec.get("stream"):
+        url += "?alt=sse"
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("TSF_AI_KEY")
+    if key:
+        headers["x-goog-api-key"] = key
+    return url, headers, body
+
+
+BUILDERS = {"openai": build_openai, "anthropic": build_anthropic,
+            "gemini": build_gemini}
+
+
+def open_request(url, headers, body):
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    ctx = ssl.create_default_context()
+    if os.environ.get("TSF_AI_INSECURE") == "1":
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return urllib.request.urlopen(req, timeout=float(
+        os.environ.get("TSF_AI_HTTP_TIMEOUT", "120")), context=ctx)
+
+
+# --- non-streaming response readers -------------------------------------
+
+def read_openai(obj):
+    ch = (obj.get("choices") or [{}])[0]
+    text = (ch.get("message") or {}).get("content") or ""
+    if isinstance(text, list):
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    u = obj.get("usage") or {}
+    return {"text": text, "model": obj.get("model"),
+            "finish_reason": ch.get("finish_reason"),
+            "usage": {"input": u.get("prompt_tokens"),
+                      "output": u.get("completion_tokens"),
+                      "total": u.get("total_tokens")}}
+
+
+def read_anthropic(obj):
+    text = "".join(b.get("text", "") for b in obj.get("content") or []
+                   if b.get("type") == "text")
+    u = obj.get("usage") or {}
+    i, o = u.get("input_tokens"), u.get("output_tokens")
+    return {"text": text, "model": obj.get("model"),
+            "finish_reason": obj.get("stop_reason"),
+            "usage": {"input": i, "output": o,
+                      "total": (i + o) if i is not None and o is not None
+                      else None}}
+
+
+def read_gemini(obj):
+    cand = (obj.get("candidates") or [{}])[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if "text" in p)
+    u = obj.get("usageMetadata") or {}
+    return {"text": text, "model": obj.get("modelVersion"),
+            "finish_reason": cand.get("finishReason"),
+            "usage": {"input": u.get("promptTokenCount"),
+                      "output": u.get("candidatesTokenCount"),
+                      "total": u.get("totalTokenCount")}}
+
+
+READERS = {"openai": read_openai, "anthropic": read_anthropic,
+           "gemini": read_gemini}
+
+
+# --- streaming delta extractors (per SSE data object) -------------------
+
+def delta_openai(obj, state):
+    ch = (obj.get("choices") or [{}])
+    piece = ""
+    if ch:
+        piece = ((ch[0].get("delta") or {}).get("content")) or ""
+        if ch[0].get("finish_reason"):
+            state["finish_reason"] = ch[0]["finish_reason"]
+    if obj.get("usage"):
+        u = obj["usage"]
+        state["usage"] = {"input": u.get("prompt_tokens"),
+                          "output": u.get("completion_tokens"),
+                          "total": u.get("total_tokens")}
+    if obj.get("model"):
+        state["model"] = obj["model"]
+    return piece
+
+
+def delta_anthropic(obj, state):
+    t = obj.get("type")
+    if t == "message_start":
+        u = (obj.get("message") or {}).get("usage") or {}
+        state.setdefault("usage", {})["input"] = u.get("input_tokens")
+        state["model"] = (obj.get("message") or {}).get("model")
+    elif t == "content_block_delta":
+        return (obj.get("delta") or {}).get("text") or ""
+    elif t == "message_delta":
+        u = obj.get("usage") or {}
+        if u.get("output_tokens") is not None:
+            state.setdefault("usage", {})["output"] = u["output_tokens"]
+        d = obj.get("delta") or {}
+        if d.get("stop_reason"):
+            state["finish_reason"] = d["stop_reason"]
+    return ""
+
+
+def delta_gemini(obj, state):
+    cand = (obj.get("candidates") or [{}])[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    if cand.get("finishReason"):
+        state["finish_reason"] = cand["finishReason"]
+    u = obj.get("usageMetadata")
+    if u:
+        state["usage"] = {"input": u.get("promptTokenCount"),
+                          "output": u.get("candidatesTokenCount"),
+                          "total": u.get("totalTokenCount")}
+    return "".join(p.get("text", "") for p in parts if "text" in p)
+
+
+DELTAS = {"openai": delta_openai, "anthropic": delta_anthropic,
+          "gemini": delta_gemini}
+
+
+def run_stream(shape, resp):
+    state = {"model": None, "finish_reason": None, "usage": {}}
+    delta = DELTAS[shape]
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            continue
+        piece = delta(obj, state)
+        if piece:
+            emit({"t": "delta", "text": piece})
+    u = state.get("usage") or {}
+    if u.get("total") is None and u.get("input") is not None \
+            and u.get("output") is not None:
+        u["total"] = u["input"] + u["output"]
+    emit({"t": "final", "text": "", "model": state.get("model"),
+          "finish_reason": state.get("finish_reason"), "usage": u})
+
+
+def main():
+    try:
+        spec = json.load(sys.stdin)
+    except ValueError as e:
+        die("bad request spec: %s" % e)
+    shape = spec.get("shape")
+    if shape not in BUILDERS:
+        die("unknown shape: %s" % shape)
+    try:
+        url, headers, body = BUILDERS[shape](spec)
+    except OSError as e:
+        die("cannot read an attachment: %s" % e)
+    try:
+        resp = open_request(url, headers, body)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:2000]
+        die(detail or e.reason, e.code)
+    except urllib.error.URLError as e:
+        die("cannot reach %s: %s" % (url, e.reason), -1)
+    except OSError as e:
+        die("transport error: %s" % e, -1)
+    if spec.get("stream"):
+        run_stream(shape, resp)
+    else:
+        try:
+            obj = json.loads(resp.read().decode("utf-8"))
+        except ValueError as e:
+            die("provider did not return JSON: %s" % e)
+        r = READERS[shape](obj)
+        emit({"t": "final", "text": r["text"], "model": r["model"],
+              "finish_reason": r["finish_reason"], "usage": r["usage"]})
+
+
+if __name__ == "__main__":
+    main()
+
